@@ -1,0 +1,8 @@
+__pycache__/
+*.mp4
+*.ts
+ts片段/
+*.json
+*.lock
+m3u8链接*.txt
+.DS_Store
