@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
-"""m3u8 分片下载/合并/转 mp4 的独立工具（被 main.py import 复用）
-说明：脱敏后的学习参考代码，站点特征已去掉，Referer 已改成占位地址。
-适配自己的目标站点时把它换成真实 Referer 即可。
+"""
+ts 分片下载与合并 · Agent 模式版
+（解析 m3u8 链接文件 → 逐集下载 ts 分片（AES 解密/断点续传/失败镜像兜底）→ 顺序合并 → ffmpeg 无损转 mp4）
+说明：这是脱敏后的学习参考代码。代码里用到的站点 Referer 一律抽象化，
+     适配时改成你目标站点的真实值即可。
+用法（手动在命令行/编辑器终端里运行；m3u8 链接有时效，抓完尽快下载）：
+  python ts_merge.py
+  自动读取同目录 m3u8链接.txt（main.py 抓取完成会自动调起本脚本，也可单独运行）
+铁律：单实例下载锁（原子 O_EXCL 抢锁）防双下载器双写同一集文件；成品已存在的集自动跳过。
 """
 import os
 import re
@@ -11,14 +17,68 @@ import shutil
 import subprocess
 import requests
 from urllib.parse import urljoin
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 
 HEADERS = {
-    "User-Agent": "Mozi****(Windows NT **; **) AppleWeb**** "
-                  "(KHTML, like **) Chro**** Safari** Edg**",
-    "Referer": "https://**.com/",}   # ← 请改成你的目标站点域名
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64 x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "Referer": "https://target-site.example.com/",}   # ← 请改成你的目标站点 Referer
 BASE = os.path.dirname(os.path.abspath(__file__))
 M3U8_TXT = os.path.join(BASE, 'm3u8链接.txt')
 SEG_DIR = os.path.join(BASE, 'ts片段')          # 每集一个子文件夹：ts片段/第N集/
+
+# ===== 单实例下载锁（独立于 main.py 的运行锁——main.py 调起本脚本时自己还握着运行锁，共用会自锁死） =====
+# 与运行锁同款三段演进：O_EXCL 原子抢锁 + PID 验活 + 空锁窗口只重试不删除
+import ctypes
+import atexit
+_LOCK = os.path.join(BASE, '下载锁.lock')
+def _pid_alive(pid):
+    k = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if k:
+        ctypes.windll.kernel32.CloseHandle(k)
+        return True
+    return ctypes.windll.kernel32.GetLastError() == 5   # 拒绝访问也=进程活着
+def _清锁():
+    try:
+        if os.path.exists(_LOCK) and open(_LOCK).read().strip() == str(os.getpid()):
+            os.remove(_LOCK)
+    except Exception:
+        pass
+def _拿锁():
+    """原子抢锁：O_EXCL 独占创建——同毫秒双启动也只放行一个（防两个下载器双写同一集文件）"""
+    for _ in range(3):
+        try:
+            fd = os.open(_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return
+        except FileExistsError:
+            try:
+                old = int(open(_LOCK).read().strip() or 0)
+            except Exception:
+                old = 0
+            if old and old != os.getpid() and _pid_alive(old):
+                print(f'⚠ 已有下载任务在跑（PID {old}），本次拒绝启动——成品会自动断点续传，稍后再跑即可')
+                sys.exit(5)
+            if not old:
+                # 锁文件是空的：对方刚 O_EXCL 抢到锁还没写入 PID（微秒级窗口），
+                # 删了会偷走人家刚到手的锁反而制造双开——只重试等它写完
+                time.sleep(0.5)
+                continue
+            print(f'  （清理崩溃残留锁：旧 PID {old} 已不存在，自动恢复）')
+            try:
+                os.remove(_LOCK)
+            except OSError:
+                pass
+            time.sleep(0.5)
+    print('⚠ 下载锁状态异常，放弃本次启动（防止不明并发互踩）')
+    sys.exit(5)
+_拿锁()
+atexit.register(_清锁)
 TIMEOUT = 20
 RETRIES = 3
 SEG_GAP = 0.15          # 每个分片之间歇 0.15 秒，降低请求密度
@@ -38,8 +98,8 @@ def get(url):
     raise RuntimeError(f'请求失败({last})：{url[:100]}')
 
 def load_episodes(txt_path):
-    """把 m3u8链接.txt 解析成 [(** 集号, 标题, 主链接, [备选...]), ...]，按文件顺序
-    文件格式：=====【**】===== / 第N集 标题  [清晰度] / 主链接行 / 备选[清晰度] 行"""
+    """把 m3u8链接.txt 解析成 [(季, 集号, 标题, 主链接, [备选...]), ...]，按文件顺序
+    文件格式：=====【季】===== / 第N集 标题  [清晰度] / 主链接行 / 备选[清晰度] 行"""
     eps, cur, season = [], None, '正片'
     with open(txt_path, encoding='utf-8', errors='ignore') as f:
         for line in f:
@@ -78,18 +138,18 @@ def load_playlist(url):
     return text, url
 
 def parse_key(line, base_url):
-    """解析 #**-X-KEY 行 -> (密钥**, **或None)；无加密返回 None"""
+    """解析 #EXT-X-KEY 行 -> (密钥bytes, IV或None)；无加密返回 None"""
     method = re.search(r'METHOD=([A-Za-z0-9-]+)', line)
     method = method.group(1) if method else 'NONE'
     if method.upper() == 'NONE':
         return None
-    if method.upper() != 'AES-**':
+    if method.upper() != 'AES-128':
         raise RuntimeError(f'暂不支持的加密方式：{method}')
     uri = re.search(r'URI="([^"]+)"', line).group(1)
     key = get(urljoin(base_url, uri)).content
     iv_m = re.search(r'IV=0[xX]([0-9a-fA-F]+)', line)
     iv = bytes.fromhex(iv_m.group(1).zfill(32)) if iv_m else None
-    print(f'  检测到 AES-** 加密，密钥 {len(key)} 字节' + ('' if iv_m else '（无 **，按段序号生成）'))
+    print(f'  检测到 AES 加密，密钥 {len(key)} 字节' + ('' if iv_m else '（无 IV，按段序号生成）'))
     return (key, iv)
 
 def parse_segments(text, base_url):
@@ -212,7 +272,7 @@ if __name__ == '__main__':
     print('===== ① 从 m3u8链接.txt 解析全部集数 =====')
     eps = load_episodes(M3U8_TXT)
     if not eps:
-        sys.exit(f'[错误] {M3U8_TXT} 里没解析到任何集数，请先运行抓取脚本')
+        sys.exit(f'[错误] {M3U8_TXT} 里没解析到任何集数，请先运行 main.py 抓取')
     multi = len({e[0] for e in eps}) > 1          # 多季节目集号会重名，标签带上季名
     for e in eps:
         e[0] = f'{e[0]}第{e[1]}集' if multi else f'第{e[1]}集'
@@ -248,7 +308,7 @@ if __name__ == '__main__':
                 text = None
         if text is None or not segs:
             print(f'⚠ {label} 所有链接都失效（m3u8 链接有时效，一般几小时）。'
-                  f'重跑抓取脚本可换新链接（断点已有的集不会自动刷新，需删 m3u8结果.json 重抓）')
+                  f'重跑 main.py 可换新链接（断点已有的集不会自动刷新，需删对应断点json重抓）')
             fail_list.append(label)
             continue
         print(f'  解析出 {len(segs)} 个分片')
